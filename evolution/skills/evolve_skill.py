@@ -18,10 +18,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from evolution.core.lm import make_lm
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import LLMJudge
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -152,11 +153,7 @@ def evolve(
     console.print(f"  Eval model: {eval_model}")
 
     # Configure DSPy
-    lm_kwargs = {}
-    if eval_model.startswith("github_copilot/"):
-        # litellm's Copilot provider needs editor headers on every request
-        lm_kwargs["extra_headers"] = {"editor-version": "vscode/1.95.0", "Copilot-Integration-Id": "vscode-chat"}
-    lm = dspy.LM(eval_model, **lm_kwargs)
+    lm = make_lm(eval_model)
     dspy.configure(lm=lm)
 
     # Create the baseline skill module
@@ -171,33 +168,60 @@ def evolve(
 
     start_time = time.time()
 
-    try:
-        def gepa_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
-            return skill_fitness_metric(gold, pred, trace)
+    judge = LLMJudge(config)
 
-        optimizer = dspy.GEPA(
-            metric=gepa_metric,
-            # newer DSPy has no max_steps; bound the budget by metric calls
+    def judge_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+        if not getattr(pred, "output", "").strip():
+            return 0.0
+        key = (gold.task_input, gold.expected_behavior, pred.output, pred.skill_text)
+        # GEPA requests feedback again for the same captured trajectory.
+        if getattr(pred, "_evolution_grade_key", None) != key:
+            pred._evolution_grade = judge.score(
+                task_input=gold.task_input,
+                expected_behavior=gold.expected_behavior,
+                agent_output=pred.output,
+                skill_text=pred.skill_text,
+            )
+            pred._evolution_grade_key = key
+        return pred._evolution_grade.composite
+
+    def optimization_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+        candidate = reassemble_skill(skill["frontmatter"], pred.skill_text)
+        violations = [c for c in validator.validate_all(candidate, "skill", baseline_text=skill["raw"]) if not c.passed]
+        if violations:
+            score = 0.0
+            feedback = "Hard constraints failed; repair these before optimizing quality: " + "; ".join(
+                f"{c.constraint_name}: {c.message}" for c in violations
+            )
+        else:
+            score = judge_metric(gold, pred, trace)
+            feedback = getattr(getattr(pred, "_evolution_grade", None), "feedback", "") or f"Quality score: {score}. Preserve required behavior."
+        if pred_name is not None:
+            return dspy.Prediction(score=score, feedback=feedback)
+        return score
+
+    reflection_lm = make_lm(optimizer_model)
+    gepa = getattr(dspy, "GEPA", None)
+    if gepa is not None:
+        optimizer = gepa(
+            metric=optimization_metric,
+            # Bound the budget by metric calls, not optimizer steps.
             max_metric_calls=max(1, iterations) * max(1, len(valset)) + len(valset),
-            reflection_lm=dspy.LM(optimizer_model, **lm_kwargs),
+            reflection_lm=reflection_lm,
         )
-
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+    else:
+        console.print("[yellow]GEPA not available, falling back to MIPROv2[/yellow]")
         optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
+            metric=optimization_metric,
+            prompt_model=reflection_lm,
+            task_model=lm,
             auto="light",
         )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+    optimized_module = optimizer.compile(
+        baseline_module,
+        trainset=trainset,
+        valset=valset,
+    )
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
@@ -225,7 +249,7 @@ def evolve(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(evolved_full)
         console.print(f"  Saved failed variant to {output_path}")
-        return
+        raise click.ClickException("Evolved skill failed hard constraints")
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
     console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")
@@ -238,11 +262,11 @@ def evolve(
         # Score baseline
         with dspy.context(lm=lm):
             baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
+            baseline_score = judge_metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
 
             evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
+            evolved_score = judge_metric(ex, evolved_pred)
             evolved_scores.append(evolved_score)
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
@@ -323,8 +347,10 @@ def evolve(
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
 @click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
-@click.option("--optimizer-model", default="openai/gpt-4.1", help="Model for GEPA reflections")
-@click.option("--eval-model", default="openai/gpt-4.1-mini", help="Model for evaluations")
+@click.option("--optimizer-model", default="openai/gpt-4.1", envvar="EVOLUTION_OPTIMIZER_MODEL", show_default=True,
+              help="Model for GEPA reflections (litellm name, or copilot/<model>)")
+@click.option("--eval-model", default="openai/gpt-4.1-mini", envvar="EVOLUTION_EVAL_MODEL", show_default=True,
+              help="Model for evaluations, judging and dataset generation (litellm name, or copilot/<model>)")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
