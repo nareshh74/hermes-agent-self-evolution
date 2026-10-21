@@ -99,12 +99,12 @@ class SkillModule(dspy.Module):
     def __init__(self, skill_text: str):
         super().__init__()
         # The skill body IS the signature instructions: that is the text GEPA/MIPRO mutate.
-        self.predictor = dspy.ChainOfThought(self.TaskWithSkill.with_instructions(skill_text))
+        self.predictor = dspy.Predict(self.TaskWithSkill.with_instructions(skill_text))
 
     @property
     def skill_text(self) -> str:
         """Current (possibly optimized) skill body."""
-        return self.predictor.predict.signature.instructions
+        return self.predictor.signature.instructions
 
     def forward(self, task_input: str) -> dspy.Prediction:
         result = self.predictor(task_input=task_input)

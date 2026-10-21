@@ -15,6 +15,9 @@ class _Spy:
 def spy(monkeypatch):
     monkeypatch.setattr(lm_mod.dspy, "LM", _Spy)
     monkeypatch.setattr(lm_mod, "_CopilotLM", _Spy)
+    monkeypatch.setattr(lm_mod, "_copilot_model", lambda base, token, name: {
+        "id": name, "supported_endpoints": ["/responses" if name.startswith("gpt-6") else "/chat/completions"]
+    })
     monkeypatch.delenv("EVOLUTION_API_BASE", raising=False)
     monkeypatch.delenv("EVOLUTION_API_KEY", raising=False)
     lm_mod._copilot_cache.clear()

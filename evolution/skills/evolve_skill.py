@@ -173,18 +173,38 @@ def evolve(
     def judge_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
         if not getattr(pred, "output", "").strip():
             return 0.0
-        return judge.score(
-            task_input=gold.task_input,
-            expected_behavior=gold.expected_behavior,
-            agent_output=pred.output,
-            skill_text=pred.skill_text,
-        ).composite
+        key = (gold.task_input, gold.expected_behavior, pred.output, pred.skill_text)
+        # GEPA requests feedback again for the same captured trajectory.
+        if getattr(pred, "_evolution_grade_key", None) != key:
+            pred._evolution_grade = judge.score(
+                task_input=gold.task_input,
+                expected_behavior=gold.expected_behavior,
+                agent_output=pred.output,
+                skill_text=pred.skill_text,
+            )
+            pred._evolution_grade_key = key
+        return pred._evolution_grade.composite
+
+    def optimization_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+        candidate = reassemble_skill(skill["frontmatter"], pred.skill_text)
+        violations = [c for c in validator.validate_all(candidate, "skill", baseline_text=skill["raw"]) if not c.passed]
+        if violations:
+            score = 0.0
+            feedback = "Hard constraints failed; repair these before optimizing quality: " + "; ".join(
+                f"{c.constraint_name}: {c.message}" for c in violations
+            )
+        else:
+            score = judge_metric(gold, pred, trace)
+            feedback = getattr(getattr(pred, "_evolution_grade", None), "feedback", "") or f"Quality score: {score}. Preserve required behavior."
+        if pred_name is not None:
+            return dspy.Prediction(score=score, feedback=feedback)
+        return score
 
     reflection_lm = make_lm(optimizer_model)
     gepa = getattr(dspy, "GEPA", None)
     if gepa is not None:
         optimizer = gepa(
-            metric=judge_metric,
+            metric=optimization_metric,
             # Bound the budget by metric calls, not optimizer steps.
             max_metric_calls=max(1, iterations) * max(1, len(valset)) + len(valset),
             reflection_lm=reflection_lm,
@@ -192,7 +212,7 @@ def evolve(
     else:
         console.print("[yellow]GEPA not available, falling back to MIPROv2[/yellow]")
         optimizer = dspy.MIPROv2(
-            metric=judge_metric,
+            metric=optimization_metric,
             prompt_model=reflection_lm,
             task_model=lm,
             auto="light",
@@ -229,7 +249,7 @@ def evolve(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(evolved_full)
         console.print(f"  Saved failed variant to {output_path}")
-        return
+        raise click.ClickException("Evolved skill failed hard constraints")
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
     console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")

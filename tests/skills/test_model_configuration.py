@@ -145,3 +145,51 @@ def test_explicit_cli_models_override_environment(provider, monkeypatch):
     assert metrics["optimizer_model"] == "openai/optimizer-explicit"
     assert metrics["eval_model"] == "openai/evaluator-explicit"
     assert requests and all(r["model"] == "evaluator-explicit" for r in requests)
+
+
+def test_oversized_baseline_does_not_outrank_valid_candidate(provider):
+    requests, args, root = provider
+    skill = root / "SKILL.md"
+    skill.write_text("---\nname: demo\ndescription: Demo\n---\n\n" + "Keep answers accurate. " * 800)
+    result = CliRunner().invoke(module.main, args)
+    assert result.exit_code == 0, result.output
+    metrics_files = list((root / "output").rglob("metrics.json"))
+    assert metrics_files, result.output
+    metrics = json.loads(metrics_files[0].read_text())
+    assert metrics["constraints_passed"]
+    evolved = next((root / "output").rglob("evolved_skill.md")).read_text()
+    assert len(evolved) < 15000
+    reflection = [json.dumps(r) for r in requests if r["model"] == "optimizer-local"]
+    assert any("15000" in r and "size" in r for r in reflection)
+
+
+def test_rejected_final_candidate_returns_failure(provider, monkeypatch):
+    _, args, root = provider
+    (root / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n\n" + "x" * 16000)
+    monkeypatch.setattr(dspy.GEPA, "compile", lambda self, student, **kw: student)
+    result = CliRunner().invoke(module.main, args)
+    assert result.exit_code != 0
+    assert (root / "output" / "demo" / "evolved_FAILED.md").is_file()
+    assert not list((root / "output").rglob("metrics.json"))
+
+
+def test_reflection_reuses_trajectory_grade_but_not_another_rubric(provider, monkeypatch):
+    requests, args, _ = provider
+
+    def compile(self, student, trainset, valset):
+        gold = valset[0]
+        pred = student(task_input=gold.task_input)
+        judgments = lambda: sum("procedure_following" in json.dumps(r["messages"]) for r in requests)
+        score = self.metric_fn(gold, pred)
+        count = judgments()
+        feedback = self.metric_fn(gold, pred, pred_name="predictor.predict")
+        assert feedback.score == score and feedback.feedback
+        assert judgments() == count
+        changed = dspy.Example(task_input=gold.task_input, expected_behavior="Another rubric")
+        self.metric_fn(changed, pred)
+        assert judgments() == count + 1
+        return student
+
+    monkeypatch.setattr(dspy.GEPA, "compile", compile)
+    result = CliRunner().invoke(module.main, args)
+    assert result.exit_code == 0, result.output

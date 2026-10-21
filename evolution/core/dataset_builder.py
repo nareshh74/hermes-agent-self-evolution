@@ -111,7 +111,7 @@ class SyntheticDatasetBuilder:
 
     def __init__(self, config: EvolutionConfig):
         self.config = config
-        self.generator = dspy.ChainOfThought(self.GenerateTestCases)
+        self.generator = dspy.Predict(self.GenerateTestCases)
 
     def generate(
         self,
