@@ -30,6 +30,7 @@ from typing import Optional
 
 import click
 import dspy
+from evolution.core.lm import make_lm
 from rich.console import Console
 from rich.progress import Progress
 
@@ -490,7 +491,7 @@ class RelevanceFilter:
         # Stage 2: LLM relevance scoring
         examples = []
         errors = 0
-        lm = dspy.LM(self.model)
+        lm = make_lm(self.model)
 
         with Progress() as progress:
             task = progress.add_task("Scoring relevance...", total=len(candidates))
