@@ -6,9 +6,11 @@ Usage:
 """
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -340,6 +342,38 @@ def evolve(
         console.print("  Try: more iterations, better eval dataset, or different optimizer model")
 
 
+def _evolve_folder(folder: Path, max_concurrent: int, opts: dict):
+    """Evolve every skill under folder in parallel (one subprocess each, capped; extras queue).
+
+    Subprocesses because dspy.configure is global/thread-bound.
+    """
+    skills = sorted(f.parent for f in folder.rglob("SKILL.md"))
+    if not skills:
+        raise click.ClickException(f"No SKILL.md found under {folder}")
+    console.print(f"Evolving {len(skills)} skills, max {max_concurrent} concurrent")
+
+    def run(d: Path):
+        cmd = [sys.executable, "-m", "evolution.skills.evolve_skill", "--skill-path", str(d)]
+        for k, v in opts.items():
+            if v is None or v is False:
+                continue
+            cmd.append("--" + k.replace("_", "-"))
+            if v is not True:
+                cmd.append(str(v))
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        console.print(f"[{'green' if r.returncode == 0 else 'red'}]{d.name}: exit {r.returncode}[/]")
+        if r.returncode:
+            console.print((r.stdout + r.stderr)[-1500:], markup=False)
+        return d.name, r.returncode
+
+    with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+        results = list(pool.map(run, skills))
+    failed = [n for n, rc in results if rc]
+    console.print(f"Done: {len(results) - len(failed)} ok, {len(failed)} failed")
+    if failed:
+        raise click.ClickException("Failed: " + ", ".join(failed))
+
+
 @click.command()
 @click.option("--skill", default=None, help="Name of the skill to evolve (looked up in hermes-agent repo)")
 @click.option("--skill-path", default=None, help="Full path to a SKILL.md (or its directory) anywhere on this machine")
@@ -354,10 +388,20 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, skill_path):
+@click.option("--max-concurrent", default=4, type=click.IntRange(min=1), envvar="EVOLUTION_MAX_CONCURRENT",
+              show_default=True, help="Max parallel evolutions when --skill-path is a folder of skills; the rest queue")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, skill_path, max_concurrent):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     if not skill and not skill_path:
         raise click.UsageError("Provide --skill or --skill-path")
+    if skill_path:
+        p = Path(skill_path).expanduser().resolve()
+        if p.is_dir() and not (p / "SKILL.md").exists():
+            _evolve_folder(p, max_concurrent, dict(
+                iterations=iterations, eval_source=eval_source, dataset_path=dataset_path,
+                optimizer_model=optimizer_model, eval_model=eval_model, hermes_repo=hermes_repo,
+                run_tests=run_tests, dry_run=dry_run))
+            return
     evolve(
         skill_name=skill,
         iterations=iterations,
