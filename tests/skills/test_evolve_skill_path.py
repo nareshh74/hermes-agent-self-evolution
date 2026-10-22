@@ -65,3 +65,25 @@ def test_folder_evolves_all_skills_with_cap(tmp_path, monkeypatch):
     r = CliRunner().invoke(m.main, ["--skill-path", str(tmp_path), "--max-concurrent", "2", "--dry-run"])
     assert r.exit_code == 0, r.output
     assert "3 ok" in r.output and peak == 2
+
+
+def test_multiple_folders_deduped(tmp_path, monkeypatch):
+    import types
+    from click.testing import CliRunner
+    from evolution.skills import evolve_skill as m
+
+    for d in ("a/x", "a/y", "b/z"):
+        (tmp_path / d).mkdir(parents=True)
+        (tmp_path / d / "SKILL.md").write_text("x")
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd[cmd.index("--skill-path") + 1])
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    # a overlaps itself via a/x, and a/x is listed twice
+    arg = f"{tmp_path / 'a'}, {tmp_path / 'b'},{tmp_path / 'a' / 'x'}"
+    r = CliRunner().invoke(m.main, ["--skill-path", arg, "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "3 ok" in r.output and len(calls) == 3 and len(set(calls)) == 3
