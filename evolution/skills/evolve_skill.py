@@ -342,14 +342,23 @@ def evolve(
         console.print("  Try: more iterations, better eval dataset, or different optimizer model")
 
 
-def _evolve_folder(folder: Path, max_concurrent: int, opts: dict):
-    """Evolve every skill under folder in parallel (one subprocess each, capped; extras queue).
+def _evolve_folder(paths: list, max_concurrent: int, opts: dict):
+    """Evolve every skill under the given paths in parallel (one subprocess each, capped; extras queue).
 
-    Subprocesses because dspy.configure is global/thread-bound.
+    Each path is a folder of skills or a single skill (dir or SKILL.md). Overlapping
+    paths are deduped. Subprocesses because dspy.configure is global/thread-bound.
     """
-    skills = sorted(f.parent for f in folder.rglob("SKILL.md"))
+    found = set()
+    for p in paths:
+        if p.is_file():
+            found.add(p.parent)
+        elif (p / "SKILL.md").exists():
+            found.add(p)
+        else:
+            found.update(f.parent for f in p.rglob("SKILL.md"))
+    skills = sorted(found)
     if not skills:
-        raise click.ClickException(f"No SKILL.md found under {folder}")
+        raise click.ClickException("No SKILL.md found under " + ", ".join(map(str, paths)))
     console.print(f"Evolving {len(skills)} skills, max {max_concurrent} concurrent")
 
     def run(d: Path):
@@ -376,7 +385,7 @@ def _evolve_folder(folder: Path, max_concurrent: int, opts: dict):
 
 @click.command()
 @click.option("--skill", default=None, help="Name of the skill to evolve (looked up in hermes-agent repo)")
-@click.option("--skill-path", default=None, help="Full path to a SKILL.md (or its directory) anywhere on this machine")
+@click.option("--skill-path", default=None, help="Path to a SKILL.md, a skill directory, or a folder of skills; comma-separate several paths")
 @click.option("--iterations", default=10, help="Number of GEPA iterations")
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
@@ -395,9 +404,10 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
     if not skill and not skill_path:
         raise click.UsageError("Provide --skill or --skill-path")
     if skill_path:
-        p = Path(skill_path).expanduser().resolve()
-        if p.is_dir() and not (p / "SKILL.md").exists():
-            _evolve_folder(p, max_concurrent, dict(
+        # ponytail: comma split, so a path containing a comma is unsupported
+        paths = [Path(x.strip()).expanduser().resolve() for x in skill_path.split(",") if x.strip()]
+        if len(paths) > 1 or (paths[0].is_dir() and not (paths[0] / "SKILL.md").exists()):
+            _evolve_folder(paths, max_concurrent, dict(
                 iterations=iterations, eval_source=eval_source, dataset_path=dataset_path,
                 optimizer_model=optimizer_model, eval_model=eval_model, hermes_repo=hermes_repo,
                 run_tests=run_tests, dry_run=dry_run))
