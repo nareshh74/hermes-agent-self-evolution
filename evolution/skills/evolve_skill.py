@@ -6,11 +6,13 @@ Usage:
 """
 
 import json
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 
@@ -36,6 +38,44 @@ from evolution.skills.skill_module import (
 console = Console()
 
 
+def _tokens(usage: dict) -> dict:
+    """Collapse dspy usage ({model: provider-specific dict}) to input/output/total per model."""
+    out = {}
+    for model, u in usage.items():
+        i = u.get("prompt_tokens", u.get("input_tokens")) or 0
+        o = u.get("completion_tokens", u.get("output_tokens")) or 0
+        out[model] = {"input": i, "output": o, "total": u.get("total_tokens") or i + o}
+    return out
+
+
+@contextmanager
+def _phase(store: dict, name: str):
+    """Record wall seconds and per-model tokens (cache hits excluded) for one phase.
+
+    Tokens are split per model, so optimizer vs eval needs different models.
+    """
+    t = time.time()
+    with dspy.track_usage() as u:
+        try:
+            yield
+        finally:
+            store[name] = {"seconds": round(time.time() - t, 2), "tokens": _tokens(u.get_total_tokens())}
+
+
+def _sum_tokens(per_model: dict) -> dict:
+    return {k: sum(m[k] for m in per_model.values()) for k in ("input", "output", "total")}
+
+
+def _merge_tokens(phases: dict) -> dict:
+    merged = {}
+    for ph in phases.values():
+        for model, t in ph["tokens"].items():
+            m = merged.setdefault(model, {"input": 0, "output": 0, "total": 0})
+            for k in m:
+                m[k] += t[k]
+    return merged
+
+
 def evolve(
     skill_name: Optional[str] = None,
     iterations: int = 10,
@@ -50,6 +90,8 @@ def evolve(
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
+    run_start = time.time()
+    phases: dict = {}
     config = EvolutionConfig(
         hermes_agent_path=resolve_hermes_agent_path(hermes_repo),
         iterations=iterations,
@@ -97,39 +139,40 @@ def evolve(
     # ── 2. Build or load evaluation dataset ─────────────────────────────
     console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {eval_source})")
 
-    if eval_source == "golden" and dataset_path:
-        dataset = GoldenDatasetLoader.load(Path(dataset_path))
-        console.print(f"  Loaded golden dataset: {len(dataset.all_examples)} examples")
-    elif eval_source == "sessiondb":
-        save_path = Path(dataset_path) if dataset_path else Path("datasets") / "skills" / skill_name
-        dataset = build_dataset_from_external(
-            skill_name=skill_name,
-            skill_text=skill["raw"],
-            sources=["claude-code", "copilot", "hermes"],
-            output_path=save_path,
-            model=eval_model,
-        )
-        if not dataset.all_examples:
-            console.print("[red]✗ No relevant examples found from session history[/red]")
+    with _phase(phases, "dataset"):
+        if eval_source == "golden" and dataset_path:
+            dataset = GoldenDatasetLoader.load(Path(dataset_path))
+            console.print(f"  Loaded golden dataset: {len(dataset.all_examples)} examples")
+        elif eval_source == "sessiondb":
+            save_path = Path(dataset_path) if dataset_path else Path("datasets") / "skills" / skill_name
+            dataset = build_dataset_from_external(
+                skill_name=skill_name,
+                skill_text=skill["raw"],
+                sources=["claude-code", "copilot", "hermes"],
+                output_path=save_path,
+                model=eval_model,
+            )
+            if not dataset.all_examples:
+                console.print("[red]✗ No relevant examples found from session history[/red]")
+                sys.exit(1)
+            console.print(f"  Mined {len(dataset.all_examples)} examples from session history")
+        elif eval_source == "synthetic":
+            builder = SyntheticDatasetBuilder(config)
+            dataset = builder.generate(
+                artifact_text=skill["raw"],
+                artifact_type="skill",
+            )
+            # Save for reuse
+            save_path = Path("datasets") / "skills" / skill_name
+            dataset.save(save_path)
+            console.print(f"  Generated {len(dataset.all_examples)} synthetic examples")
+            console.print(f"  Saved to {save_path}/")
+        elif dataset_path:
+            dataset = EvalDataset.load(Path(dataset_path))
+            console.print(f"  Loaded dataset: {len(dataset.all_examples)} examples")
+        else:
+            console.print("[red]✗ Specify --dataset-path or use --eval-source synthetic[/red]")
             sys.exit(1)
-        console.print(f"  Mined {len(dataset.all_examples)} examples from session history")
-    elif eval_source == "synthetic":
-        builder = SyntheticDatasetBuilder(config)
-        dataset = builder.generate(
-            artifact_text=skill["raw"],
-            artifact_type="skill",
-        )
-        # Save for reuse
-        save_path = Path("datasets") / "skills" / skill_name
-        dataset.save(save_path)
-        console.print(f"  Generated {len(dataset.all_examples)} synthetic examples")
-        console.print(f"  Saved to {save_path}/")
-    elif dataset_path:
-        dataset = EvalDataset.load(Path(dataset_path))
-        console.print(f"  Loaded dataset: {len(dataset.all_examples)} examples")
-    else:
-        console.print("[red]✗ Specify --dataset-path or use --eval-source synthetic[/red]")
-        sys.exit(1)
 
     console.print(f"  Split: {len(dataset.train)} train / {len(dataset.val)} val / {len(dataset.holdout)} holdout")
 
@@ -219,11 +262,12 @@ def evolve(
             task_model=lm,
             auto="light",
         )
-    optimized_module = optimizer.compile(
-        baseline_module,
-        trainset=trainset,
-        valset=valset,
-    )
+    with _phase(phases, "optimize"):
+        optimized_module = optimizer.compile(
+            baseline_module,
+            trainset=trainset,
+            valset=valset,
+        )
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
@@ -260,16 +304,17 @@ def evolve(
 
     baseline_scores = []
     evolved_scores = []
-    for ex in holdout_examples:
-        # Score baseline
-        with dspy.context(lm=lm):
-            baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = judge_metric(ex, baseline_pred)
-            baseline_scores.append(baseline_score)
+    with _phase(phases, "holdout"):
+        for ex in holdout_examples:
+            # Score baseline
+            with dspy.context(lm=lm):
+                baseline_pred = baseline_module(task_input=ex.task_input)
+                baseline_score = judge_metric(ex, baseline_pred)
+                baseline_scores.append(baseline_score)
 
-            evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = judge_metric(ex, evolved_pred)
-            evolved_scores.append(evolved_score)
+                evolved_pred = optimized_module(task_input=ex.task_input)
+                evolved_score = judge_metric(ex, evolved_pred)
+                evolved_scores.append(evolved_score)
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
@@ -329,8 +374,12 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "duration_seconds": round(time.time() - run_start, 2),
+        "phases": phases,
+        "tokens": {"total": _sum_tokens(_merge_tokens(phases)), "by_model": _merge_tokens(phases)},
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    print(f"METRICS_PATH={output_dir / 'metrics.json'}")
 
     console.print(f"\n  Output saved to {output_dir}/")
 
@@ -340,6 +389,40 @@ def evolve(
     else:
         console.print(f"\n[yellow]⚠ Evolution did not improve skill (change: {improvement:+.3f})[/yellow]")
         console.print("  Try: more iterations, better eval dataset, or different optimizer model")
+
+
+def _folder_summary(results: list, wall: float):
+    """Print and save total/per-skill duration and tokens (dataset, optimize, holdout)."""
+    rows = {n: m for n, _, m in results if m}
+    by_model: dict = {}
+    for m in rows.values():
+        for model, t in m["tokens"]["by_model"].items():
+            b = by_model.setdefault(model, {"input": 0, "output": 0, "total": 0})
+            for k in b:
+                b[k] += t[k]
+    summary = {
+        "wall_seconds": round(wall, 2),
+        "skills_with_metrics": len(rows),
+        "skill_seconds_sum": round(sum(m["duration_seconds"] for m in rows.values()), 2),
+        "tokens": {"total": _sum_tokens(by_model), "by_model": by_model},
+        "skills": {n: {"duration_seconds": m["duration_seconds"], "phases": m["phases"], "tokens": m["tokens"]}
+                   for n, m in rows.items()},
+    }
+    table = Table(title="Run metrics")
+    for c in ("Skill", "Seconds", "Dataset s", "Optimize s", "Holdout s", "Tokens"):
+        table.add_column(c, justify="right" if c != "Skill" else "left")
+    for n, m in sorted(rows.items()):
+        ph = m["phases"]
+        table.add_row(n, f"{m['duration_seconds']:.0f}", *(f"{ph.get(k, {}).get('seconds', 0):.0f}" for k in ("dataset", "optimize", "holdout")),
+                      f"{m['tokens']['total']['total']:,}")
+    table.add_row("TOTAL", f"{wall:.0f} wall", "", "", "", f"{summary['tokens']['total']['total']:,}")
+    console.print(table)
+    for model, t in by_model.items():
+        console.print(f"  {model}: in {t['input']:,} / out {t['output']:,} / total {t['total']:,}")
+    out = Path("output") / f"run_summary_{datetime.now():%Y%m%d_%H%M%S}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2))
+    console.print(f"  Summary saved to {out}")
 
 
 def _evolve_folder(paths: list, max_concurrent: int, opts: dict):
@@ -360,6 +443,7 @@ def _evolve_folder(paths: list, max_concurrent: int, opts: dict):
     if not skills:
         raise click.ClickException("No SKILL.md found under " + ", ".join(map(str, paths)))
     console.print(f"Evolving {len(skills)} skills, max {max_concurrent} concurrent")
+    t0 = time.time()
 
     def run(d: Path):
         cmd = [sys.executable, "-m", "evolution.skills.evolve_skill", "--skill-path", str(d)]
@@ -373,12 +457,14 @@ def _evolve_folder(paths: list, max_concurrent: int, opts: dict):
         console.print(f"[{'green' if r.returncode == 0 else 'red'}]{d.name}: exit {r.returncode}[/]")
         if r.returncode:
             console.print((r.stdout + r.stderr)[-1500:], markup=False)
-        return d.name, r.returncode
+        m = re.search(r"^METRICS_PATH=(.+)$", r.stdout, re.M)
+        return d.name, r.returncode, json.loads(Path(m.group(1).strip()).read_text()) if m else None
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
         results = list(pool.map(run, skills))
-    failed = [n for n, rc in results if rc]
+    failed = [n for n, rc, _ in results if rc]
     console.print(f"Done: {len(results) - len(failed)} ok, {len(failed)} failed")
+    _folder_summary(results, time.time() - t0)
     if failed:
         raise click.ClickException("Failed: " + ", ".join(failed))
 
