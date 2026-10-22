@@ -37,3 +37,31 @@ def test_requires_skill_or_skill_path(tmp_path):
     r = _run(tmp_path)
     assert r.exit_code != 0
     assert "--skill" in r.output
+
+
+def test_folder_evolves_all_skills_with_cap(tmp_path, monkeypatch):
+    import threading
+    from click.testing import CliRunner
+    from evolution.skills import evolve_skill as m
+
+    for n in "abc":
+        (tmp_path / n).mkdir()
+        (tmp_path / n / "SKILL.md").write_text("x")
+    live = peak = 0
+    lock = threading.Lock()
+
+    def fake_run(cmd, **kw):
+        nonlocal live, peak
+        import time, types
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(0.1)
+        with lock:
+            live -= 1
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    r = CliRunner().invoke(m.main, ["--skill-path", str(tmp_path), "--max-concurrent", "2", "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "3 ok" in r.output and peak == 2
