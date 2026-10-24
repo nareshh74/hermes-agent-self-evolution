@@ -31,8 +31,9 @@ def provider(tmp_path, monkeypatch):
             if "optimizer" in body["model"]:
                 content = json.dumps({"new_instruction": "# Demo\nAnswer the task correctly, directly and concisely."})
             elif "correctness" in messages and "procedure_following" in messages:
+                correctness = 0.9 if "Answer the task correctly" in messages else 0.8
                 content = ('[[ ## reasoning ## ]]\nRubric checked.\n'
-                           '[[ ## correctness ## ]]\n0.8\n'
+                           f'[[ ## correctness ## ]]\n{correctness}\n'
                            '[[ ## procedure_following ## ]]\n0.6\n'
                            '[[ ## conciseness ## ]]\n1.0\n'
                            '[[ ## feedback ## ]]\nBe specific.\n[[ ## completed ## ]]')
@@ -77,6 +78,20 @@ def provider(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_cli_apply_updates_source_and_keeps_audit(provider):
+    _, args, root = provider
+    skill = root / "SKILL.md"
+    baseline = skill.read_text(encoding="utf-8")
+    result = CliRunner().invoke(module.main, [*args, "--apply"])
+    assert result.exit_code == 0, result.output
+    assert skill.read_text(encoding="utf-8") != baseline
+    output = next((root / "output").rglob("metrics.json")).parent
+    metrics = json.loads((output / "metrics.json").read_text())
+    assert metrics["applied"] is True
+    assert (output / "baseline_skill.md").read_text() == baseline
+    assert (output / "evolved_skill.md").read_text() == skill.read_text(encoding="utf-8")
 
 
 def test_cli_uses_selected_models_and_llm_judgment(provider):
