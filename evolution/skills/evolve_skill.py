@@ -6,13 +6,15 @@ Usage:
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 
@@ -36,6 +38,39 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+
+def _apply_evolved(source: Path, baseline: str, evolved: str) -> bool:
+    """Replace an unchanged source skill under an exclusive per-skill lock."""
+    body = evolved.split("---", 2)[-1].strip() if evolved.startswith("---") else evolved.strip()
+    if not body:
+        raise ValueError("refusing to apply evolved skill with empty body")
+    if not re.search(r"^name:\s*\S+", evolved, re.M) or not re.search(r"^description:\s*\S+", evolved, re.M):
+        raise ValueError("refusing to apply evolved skill without name and description")
+    lock = source.with_name(f".{source.name}.evolution.lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise RuntimeError(f"source is already being evolved: {source}") from exc
+    tmp_name = None
+    try:
+        os.close(fd)
+        if source.read_text(encoding="utf-8") != baseline:
+            raise RuntimeError(f"source changed during evolution: {source}")
+        mode = source.stat().st_mode
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{source.name}.", suffix=".tmp", dir=source.parent)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(evolved)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, source)
+        tmp_name = None
+    finally:
+        if tmp_name and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        lock.unlink(missing_ok=True)
+    return True
 
 
 def _tokens(usage: dict) -> dict:
@@ -87,6 +122,7 @@ def evolve(
     run_tests: bool = False,
     dry_run: bool = False,
     skill_path: Optional[str] = None,
+    apply: bool = False,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -280,6 +316,9 @@ def evolve(
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
     evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
+    if run_tests:
+        test_result = validator.run_test_suite(repo)
+        evolved_constraints.append(test_result)
     all_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -374,11 +413,17 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "apply_requested": apply,
+        "applied": False,
+        "source_path": str(found),
         "duration_seconds": round(time.time() - run_start, 2),
         "phases": phases,
         "tokens": {"total": _sum_tokens(_merge_tokens(phases)), "by_model": _merge_tokens(phases)},
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    if apply and improvement > 0 and all_pass:
+        metrics["applied"] = _apply_evolved(found, skill["raw"], evolved_full)
+        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     print(f"METRICS_PATH={output_dir / 'metrics.json'}")
 
     console.print(f"\n  Output saved to {output_dir}/")
@@ -431,15 +476,14 @@ def _evolve_folder(paths: list, max_concurrent: int, opts: dict):
     Each path is a folder of skills or a single skill (dir or SKILL.md). Overlapping
     paths are deduped. Subprocesses because dspy.configure is global/thread-bound.
     """
-    found = set()
+    found = {}
     for p in paths:
-        if p.is_file():
-            found.add(p.parent)
-        elif (p / "SKILL.md").exists():
-            found.add(p)
-        else:
-            found.update(f.parent for f in p.rglob("SKILL.md"))
-    skills = sorted(found)
+        candidates = ([p] if p.is_file() or (p / "SKILL.md").exists()
+                      else sorted(f.parent for f in p.rglob("SKILL.md")))
+        for candidate in candidates:
+            d = candidate.parent if candidate.is_file() else candidate
+            found.setdefault(d.name, d)
+    skills = list(found.values())
     if not skills:
         raise click.ClickException("No SKILL.md found under " + ", ".join(map(str, paths)))
     console.print(f"Evolving {len(skills)} skills, max {max_concurrent} concurrent")
@@ -483,9 +527,10 @@ def _evolve_folder(paths: list, max_concurrent: int, opts: dict):
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
+@click.option("--apply", is_flag=True, help="Replace source SKILL.md only when holdout improves and constraints pass")
 @click.option("--max-concurrent", default=4, type=click.IntRange(min=1), envvar="EVOLUTION_MAX_CONCURRENT",
               show_default=True, help="Max parallel evolutions when --skill-path is a folder of skills; the rest queue")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, skill_path, max_concurrent):
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, apply, skill_path, max_concurrent):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     if not skill and not skill_path:
         raise click.UsageError("Provide --skill or --skill-path")
@@ -496,7 +541,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
             _evolve_folder(paths, max_concurrent, dict(
                 iterations=iterations, eval_source=eval_source, dataset_path=dataset_path,
                 optimizer_model=optimizer_model, eval_model=eval_model, hermes_repo=hermes_repo,
-                run_tests=run_tests, dry_run=dry_run))
+                run_tests=run_tests, dry_run=dry_run, apply=apply))
             return
     evolve(
         skill_name=skill,
@@ -509,6 +554,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         run_tests=run_tests,
         dry_run=dry_run,
         skill_path=skill_path,
+        apply=apply,
     )
 
 
